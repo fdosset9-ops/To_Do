@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Matrice — priorisation &amp; agenda</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Lora:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="bg-grid" aria-hidden="true"></div>
+<div class="app" id="app">
+
+  <header class="topbar">
+    <div class="wordmark">
+      <h1>matrice</h1>
+      <p class="legend">faire · planifier · déléguer · éliminer</p>
+    </div>
+    <div class="topbar-actions">
+      <div id="userBadge" class="user-badge" hidden></div>
+      <button class="iconbtn" data-action="toggle-focus" id="focusBtn" title="Mode focus (F)" aria-label="Mode focus">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3.2"/><circle cx="12" cy="12" r="8.5"/></svg>
+      </button>
+      <button class="iconbtn" data-action="toggle-theme" id="themeBtn" title="Thème (D)" aria-label="Changer de thème"></button>
+    </div>
+  </header>
+
+  <section class="auth-gate" id="authGate">
+    <div class="auth-card">
+      <p class="auth-lead">Connecte-toi avec Google pour retrouver tes tâches sur tous tes appareils et synchroniser ton agenda.</p>
+      <button class="btn-google" data-action="login">
+        <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.57 2.7-3.88 2.7-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.55-1.84.87-3.06.87-2.36 0-4.36-1.59-5.08-3.73H.9v2.33A9 9 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.92 10.7A5.4 5.4 0 0 1 3.64 9c0-.59.1-1.16.28-1.7V4.97H.9A9 9 0 0 0 0 9c0 1.45.35 2.83.9 4.03l3.02-2.33z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.5.46 3.44 1.35l2.57-2.57A8.9 8.9 0 0 0 9 0 9 9 0 0 0 .9 4.97L3.92 7.3C4.64 5.17 6.64 3.58 9 3.58z"/></svg>
+        Se connecter avec Google
+      </button>
+      <p class="auth-error" id="authError"></p>
+    </div>
+  </section>
+
+  <div id="mainContent" hidden>
+
+    <section class="quickadd">
+      <form id="addForm">
+        <input id="taskInput" type="text" placeholder="Nouvelle tâche… (N)" autocomplete="off" maxlength="140" />
+        <div class="axis-toggles">
+          <button type="button" class="pill" data-action="toggle-axis" data-axis="important" id="pillImportant">Important</button>
+          <button type="button" class="pill" data-action="toggle-axis" data-axis="urgent" id="pillUrgent">Urgent</button>
+        </div>
+        <input type="date" id="dueInput" class="due-input" />
+        <div class="quick-dates">
+          <button type="button" data-action="quick-date" data-quick="today">Aujourd'hui</button>
+          <button type="button" data-action="quick-date" data-quick="tomorrow">Demain</button>
+          <button type="button" data-action="quick-date" data-quick="week">+ 1 semaine</button>
+        </div>
+        <button type="submit" class="btn-primary">Ajouter</button>
+      </form>
+      <p class="preview" id="quadPreview"></p>
+    </section>
+
+    <section class="stats" id="statsBar"></section>
+
+    <section class="matrix-wrap" id="matrixWrap">
+      <span class="axis-label axis-top">important</span>
+      <span class="axis-label axis-bottom">pas important</span>
+      <span class="axis-label axis-left">urgent</span>
+      <span class="axis-label axis-right">pas urgent</span>
+      <div class="crosshair-v" aria-hidden="true"></div>
+      <div class="crosshair-h" aria-hidden="true"></div>
+      <div class="matrix-grid" id="matrixGrid"></div>
+    </section>
+
+    <section class="bottom-grid">
+      <div class="panel pomodoro-panel">
+        <div class="panel-head"><h2>Pomodoro</h2></div>
+        <div class="dial-wrap">
+          <svg class="dial" viewBox="0 0 200 200">
+            <circle class="dial-track" cx="100" cy="100" r="88"></circle>
+            <circle class="dial-progress" id="dialProgress" cx="100" cy="100" r="88"></circle>
+          </svg>
+          <div class="dial-center">
+            <span class="time-display" id="timeDisplay">25:00</span>
+            <span class="mode-display" id="modeDisplay">travail</span>
+          </div>
+        </div>
+        <div class="pomo-controls">
+          <button class="btn-primary" data-action="pomodoro-toggle" id="pomoToggleBtn">Démarrer</button>
+          <button class="btn-secondary" data-action="pomodoro-reset">Réinitialiser</button>
+          <button class="iconbtn" data-action="pomodoro-sound" id="soundBtn" title="Son" aria-label="Activer / couper le son"></button>
+        </div>
+        <select id="pomoTaskSelect"><option value="">Session libre — aucune tâche liée</option></select>
+        <div class="pomo-settings">
+          <label>Travail <input type="number" id="workMinInput" min="1" max="90" value="25" /> min</label>
+          <label>Pause <input type="number" id="breakMinInput" min="1" max="60" value="5" /> min</label>
+        </div>
+        <div class="session-dots" id="sessionDots"></div>
+        <p class="agenda-hint">sessions terminées aujourd'hui</p>
+      </div>
+
+      <div class="panel agenda-panel">
+        <div class="panel-head">
+          <h2>Agenda Google</h2>
+          <button class="btn-secondary" data-action="sync-calendar" id="syncBtn">Synchroniser</button>
+        </div>
+        <p class="sync-meta" id="syncMeta">Pas encore synchronisé.</p>
+        <ul class="event-list" id="eventList"></ul>
+        <p class="agenda-hint">Lit tes prochains événements Google Agenda et permet de les transformer en tâches.</p>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
