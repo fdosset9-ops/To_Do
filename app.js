@@ -36,7 +36,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
   /* ===================== STATE ===================== */
   var DEFAULTS = {
-    settings: { theme:null, workMin:25, breakMin:5, soundOn:true, sessionsToday:0, lastSessionDate:null },
+    settings: { theme:null, workMin:25, breakMin:5, longBreakMin:15, soundOn:true, sessionsToday:0, lastSessionDate:null },
     tasks: [],
     agenda: { events:[], lastSync:null, error:null }
   };
@@ -44,6 +44,11 @@ import { firebaseConfig } from "./firebase-config.js";
   var draft = { important:false, urgent:false };
   var focusMode = false;
   var saveTimer = null;
+  var editingTaskId = null;     // tâche en cours de renommage
+  var cancelRename = false;     // intention Échap vs validation lors du blur
+  var justCompletedId = null;   // déclenche l'animation de complétion une seule fois
+  var pendingDelete = null;     // { task, index, timeoutId } pour le toast "Annuler"
+  var expandedTaskIds = new Set(); // menus de tâche dépliés (survit aux re-rendus)
 
   function stateDocRef(uid){ return doc(db, 'users', uid); }
 
@@ -65,6 +70,12 @@ import { firebaseConfig } from "./firebase-config.js";
         state.settings = Object.assign({}, DEFAULTS.settings, data.settings || {});
         state.agenda = Object.assign({}, DEFAULTS.agenda, data.agenda || {});
         if(!state.tasks) state.tasks = [];
+        // migration douce : les tâches créées avant l'ajout du tri manuel
+        // n'ont pas de champ "order" — on leur en donne un cohérent (plus
+        // récent = plus haut), sans perturber celles déjà ordonnées.
+        state.tasks.forEach(function(t, i){
+          if(typeof t.order !== 'number') t.order = -(t.createdAt || (Date.now() - i));
+        });
       } else {
         state = JSON.parse(JSON.stringify(DEFAULTS));
         setDoc(stateDocRef(uid), state);
@@ -73,12 +84,14 @@ import { firebaseConfig } from "./firebase-config.js";
       applyTheme(state.settings.theme || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
       document.getElementById('workMinInput').value = state.settings.workMin;
       document.getElementById('breakMinInput').value = state.settings.breakMin;
-      if(!pomo.running) pomo.remaining = (pomo.mode==='work' ? state.settings.workMin : state.settings.breakMin) * 60;
+      document.getElementById('longBreakMinInput').value = state.settings.longBreakMin;
+      if(!pomo.running) pomo.remaining = (pomo.mode==='work' ? state.settings.workMin : (pomo.isLongBreak ? state.settings.longBreakMin : state.settings.breakMin)) * 60;
       updateQuadPreview();
       renderAll();
       renderPomodoro();
     }, function(err){ console.error('Lecture Firestore impossible', err); });
   }
+
 
   /* ===================== DATE HELPERS ===================== */
   function pad(n){ return String(n).padStart(2,'0'); }
@@ -95,12 +108,18 @@ import { firebaseConfig } from "./firebase-config.js";
   }
 
   /* ===================== TASK CRUD ===================== */
+  function activeSiblings(quadrantKey, excludeId){
+    return state.tasks.filter(function(t){ return t.quadrant===quadrantKey && !t.done && t.id!==excludeId; });
+  }
   function addTask(title, important, urgent, due){
     var q = qByAxes(important, urgent);
+    var siblings = activeSiblings(q.key, null);
+    var minOrder = siblings.reduce(function(m,s){ return Math.min(m, s.order||0); }, 0);
     var task = {
       id: 'tk_' + Date.now() + '_' + Math.random().toString(36).slice(2,7),
       title: title.trim(), quadrant: q.key, important: important, urgent: urgent,
-      due: due || null, done:false, completedAt:null, createdAt: Date.now(), pomodoroCount:0
+      due: due || null, done:false, completedAt:null, createdAt: Date.now(), pomodoroCount:0,
+      order: minOrder - 1 // apparaît en tête de son quadrant, comme avant
     };
     state.tasks.unshift(task);
     scheduleSave(); renderAll();
@@ -110,17 +129,63 @@ import { firebaseConfig } from "./firebase-config.js";
     var q = qByKey(quadrantKey);
     if(!t || !q) return;
     t.quadrant = q.key; t.important = q.important; t.urgent = q.urgent;
+    var siblings = activeSiblings(quadrantKey, id);
+    var maxOrder = siblings.reduce(function(m,s){ return Math.max(m, s.order||0); }, -1);
+    t.order = maxOrder + 1; // rejoint la fin de la nouvelle liste
+    scheduleSave(); renderAll();
+  }
+  function reorderTask(id, quadrantKey, insertionIndex){
+    var t = state.tasks.find(function(t){ return t.id===id; });
+    var q = qByKey(quadrantKey);
+    if(!t || !q) return;
+    t.quadrant = q.key; t.important = q.important; t.urgent = q.urgent;
+    var siblings = activeSiblings(quadrantKey, id);
+    siblings.sort(function(a,b){ return (a.order||0)-(b.order||0); });
+    var idx = Math.max(0, Math.min(insertionIndex, siblings.length));
+    siblings.splice(idx, 0, t);
+    siblings.forEach(function(s, i){ s.order = i; });
     scheduleSave(); renderAll();
   }
   function toggleDone(id){
     var t = state.tasks.find(function(t){ return t.id===id; });
     if(!t) return;
     t.done = !t.done; t.completedAt = t.done ? Date.now() : null;
+    justCompletedId = t.done ? id : null;
     scheduleSave(); renderAll();
   }
+  function renameTask(id){
+    cancelRename = false;
+    editingTaskId = id;
+    renderMatrix();
+  }
+  function commitRename(id, value){
+    var t = state.tasks.find(function(t){ return t.id===id; });
+    var trimmed = (value||'').trim();
+    if(t && trimmed){ t.title = trimmed; scheduleSave(); }
+    editingTaskId = null;
+    renderAll();
+  }
   function deleteTask(id){
-    state.tasks = state.tasks.filter(function(t){ return t.id!==id; });
+    var index = state.tasks.findIndex(function(t){ return t.id===id; });
+    if(index === -1) return;
+    var task = state.tasks[index];
+    state.tasks.splice(index, 1);
     if(pomo.linkedTaskId === id) pomo.linkedTaskId = '';
+    if(pendingDelete) clearTimeout(pendingDelete.timeoutId);
+    pendingDelete = {
+      task: task, index: index,
+      timeoutId: setTimeout(function(){ pendingDelete = null; hideToast(); }, 5000)
+    };
+    scheduleSave(); renderAll();
+    showToast('Tâche supprimée — « ' + task.title + ' »');
+  }
+  function undoDelete(){
+    if(!pendingDelete) return;
+    clearTimeout(pendingDelete.timeoutId);
+    var idx = Math.min(pendingDelete.index, state.tasks.length);
+    state.tasks.splice(idx, 0, pendingDelete.task);
+    pendingDelete = null;
+    hideToast();
     scheduleSave(); renderAll();
   }
   function clearDone(){
@@ -132,6 +197,20 @@ import { firebaseConfig } from "./firebase-config.js";
     if(!t) return;
     t.due = iso || null;
     scheduleSave(); renderAll();
+  }
+
+  /* ===================== TOAST ===================== */
+  function showToast(message){
+    var toast = document.getElementById('toast');
+    document.getElementById('toastMessage').textContent = message;
+    toast.hidden = false;
+    void toast.offsetWidth; // force le recalcul de mise en page pour que l'entrée s'anime
+    toast.classList.add('visible');
+  }
+  function hideToast(){
+    var toast = document.getElementById('toast');
+    toast.classList.remove('visible');
+    setTimeout(function(){ if(!pendingDelete) toast.hidden = true; }, 260);
   }
 
   /* ===================== RENDER: MATRIX ===================== */
@@ -155,14 +234,20 @@ import { firebaseConfig } from "./firebase-config.js";
     }).join('');
   }
   function taskCardHtml(t){
+    var isEditing = (t.id === editingTaskId);
+    var isExpanded = expandedTaskIds.has(t.id);
+    var titleHtml = isEditing
+      ? '<input type="text" class="task-title-edit" data-id="'+t.id+'" value="'+escapeHtml(t.title)+'" maxlength="140" />'
+      : '<p class="task-title">'+escapeHtml(t.title)+'</p>';
     return (
-      '<li class="task'+(t.done?' is-done':'')+'" data-id="'+t.id+'">'+
+      '<li class="task'+(t.done?' is-done':'')+(isExpanded?' expanded':'')+'" data-id="'+t.id+'">'+
         '<span class="drag-handle" data-id="'+t.id+'" aria-hidden="true">⠿</span>'+
         '<button class="check" data-action="toggle-done" data-id="'+t.id+'" aria-label="Marquer comme terminé">'+(t.done?'✓':'')+'</button>'+
         '<div class="task-body">'+
-          '<p class="task-title">'+escapeHtml(t.title)+'</p>'+
+          titleHtml+
           '<p class="task-meta">'+taskMetaTags(t)+'</p>'+
           '<div class="task-actions">'+
+            '<button data-action="rename-task" data-id="'+t.id+'">renommer</button>'+
             moveButtonsHtml(t)+
             '<button data-action="set-due" data-id="'+t.id+'" data-due="'+todayISO()+'">échéance: aujourd\'hui</button>'+
             '<button data-action="set-due" data-id="'+t.id+'" data-due="">effacer échéance</button>'+
@@ -181,9 +266,8 @@ import { firebaseConfig } from "./firebase-config.js";
       var tasks = state.tasks.filter(function(t){ return t.quadrant === key; });
       tasks.sort(function(a,b){
         if(a.done !== b.done) return a.done ? 1 : -1;
-        if(a.due && b.due) return a.due < b.due ? -1 : 1;
-        if(a.due) return -1; if(b.due) return 1;
-        return b.createdAt - a.createdAt;
+        if(!a.done) return (a.order||0) - (b.order||0);
+        return (b.completedAt||0) - (a.completedAt||0);
       });
       var activeCount = tasks.filter(function(t){ return !t.done; }).length;
       var body = tasks.length ? tasks.map(taskCardHtml).join('') : '<li class="quadrant-empty">aucune tâche ici</li>';
@@ -199,6 +283,19 @@ import { firebaseConfig } from "./firebase-config.js";
         '</div>'
       );
     }).join('');
+
+    if(editingTaskId){
+      var editEl = grid.querySelector('.task-title-edit[data-id="'+editingTaskId+'"]');
+      if(editEl){ editEl.focus(); editEl.setSelectionRange(editEl.value.length, editEl.value.length); }
+    }
+    if(justCompletedId){
+      var doneEl = grid.querySelector('.task[data-id="'+justCompletedId+'"]');
+      if(doneEl){
+        doneEl.classList.add('just-completed');
+        doneEl.addEventListener('animationend', function(){ doneEl.classList.remove('just-completed'); }, { once:true });
+      }
+      justCompletedId = null;
+    }
   }
   function renderStats(){
     var bar = document.getElementById('statsBar');
@@ -237,6 +334,34 @@ import { firebaseConfig } from "./firebase-config.js";
       var sourceCard = handle.closest('.task');
       var startX = e.clientX, startY = e.clientY;
       var dragging = false, ghost = null;
+      var dropQuadrant = null, dropIndex = null;
+
+      function clearMarkers(){
+        document.querySelectorAll('.drop-marker-before,.drop-marker-after').forEach(function(el){
+          el.classList.remove('drop-marker-before','drop-marker-after');
+        });
+      }
+      function updateDropTarget(clientX, clientY){
+        document.querySelectorAll('.quadrant-body.drag-over').forEach(function(el){ el.classList.remove('drag-over'); });
+        clearMarkers();
+        var el = document.elementFromPoint(clientX, clientY);
+        var body = el && el.closest && el.closest('.quadrant-body');
+        if(!body){ dropQuadrant = null; dropIndex = null; return; }
+        body.classList.add('drag-over');
+        dropQuadrant = body.dataset.quadrant;
+        var items = Array.prototype.slice.call(body.querySelectorAll('.task:not(.is-done)'))
+          .filter(function(li){ return li.dataset.id !== taskId; });
+        var idx = items.length;
+        for(var i=0;i<items.length;i++){
+          var rect = items[i].getBoundingClientRect();
+          if(clientY < rect.top + rect.height/2){ idx = i; break; }
+        }
+        dropIndex = idx;
+        if(items.length){
+          if(idx >= items.length){ items[items.length-1].classList.add('drop-marker-after'); }
+          else { items[idx].classList.add('drop-marker-before'); }
+        }
+      }
 
       function onMove(ev){
         var dx = ev.clientX-startX, dy = ev.clientY-startY;
@@ -257,22 +382,18 @@ import { firebaseConfig } from "./firebase-config.js";
         if(dragging && ghost){
           ghost.style.left = (ev.clientX - ghost.offsetWidth/2) + 'px';
           ghost.style.top = (ev.clientY - 18) + 'px';
-          document.querySelectorAll('.quadrant-body.drag-over').forEach(function(el){ el.classList.remove('drag-over'); });
-          var el = document.elementFromPoint(ev.clientX, ev.clientY);
-          var body = el && el.closest && el.closest('.quadrant-body');
-          if(body) body.classList.add('drag-over');
+          updateDropTarget(ev.clientX, ev.clientY);
         }
       }
       function onUp(ev){
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
         if(dragging){
-          var el = document.elementFromPoint(ev.clientX, ev.clientY);
-          var body = el && el.closest && el.closest('.quadrant-body');
+          clearMarkers();
           document.querySelectorAll('.quadrant-body.drag-over').forEach(function(b){ b.classList.remove('drag-over'); });
           if(ghost) ghost.remove();
           sourceCard.style.opacity = '';
-          if(body) moveTask(taskId, body.dataset.quadrant);
+          if(dropQuadrant) reorderTask(taskId, dropQuadrant, dropIndex==null?0:dropIndex);
         }
       }
       window.addEventListener('pointermove', onMove);
@@ -291,9 +412,12 @@ import { firebaseConfig } from "./firebase-config.js";
   }
 
   /* ===================== POMODORO ===================== */
-  var pomo = { mode:'work', remaining: 25*60, running:false, intervalId:null, linkedTaskId:'' };
+  var pomo = { mode:'work', remaining: 25*60, running:false, intervalId:null, linkedTaskId:'', isLongBreak:false };
 
-  function pomoTotal(){ return (pomo.mode==='work' ? state.settings.workMin : state.settings.breakMin) * 60; }
+  function pomoTotal(){
+    if(pomo.mode==='work') return state.settings.workMin*60;
+    return (pomo.isLongBreak ? state.settings.longBreakMin : state.settings.breakMin) * 60;
+  }
   function formatTime(s){ var m=Math.floor(s/60), sec=s%60; return pad(m)+':'+pad(sec); }
   function renderPomoDial(){
     var frac = pomo.remaining / pomoTotal();
@@ -303,7 +427,7 @@ import { firebaseConfig } from "./firebase-config.js";
     progress.style.strokeDashoffset = offset;
     progress.classList.toggle('mode-break', pomo.mode==='break');
     document.getElementById('timeDisplay').textContent = formatTime(pomo.remaining);
-    document.getElementById('modeDisplay').textContent = pomo.mode==='work' ? 'travail' : 'pause';
+    document.getElementById('modeDisplay').textContent = pomo.mode==='work' ? 'travail' : (pomo.isLongBreak ? 'pause longue' : 'pause');
     document.getElementById('pomoToggleBtn').textContent = pomo.running ? 'Pause' : (pomo.remaining < pomoTotal() ? 'Reprendre' : 'Démarrer');
   }
   function renderSessionDots(){
@@ -341,10 +465,20 @@ import { firebaseConfig } from "./firebase-config.js";
       osc.start(); osc.stop(ctx.currentTime+dur+0.03);
     }catch(e){}
   }
+  function notifyIfAllowed(title, body){
+    if(!('Notification' in window)) return;
+    if(Notification.permission === 'granted'){
+      try{ new Notification(title, { body: body, silent:true, icon:'icons/icon-192.png' }); }catch(e){}
+    }
+  }
   function announceTransition(){
-    if(!state.settings.soundOn) return;
-    if(pomo.mode==='break'){ beep(880,0.13); setTimeout(function(){ beep(880,0.16); },150); }
-    else{ beep(620,0.18); }
+    var enteringBreak = (pomo.mode === 'break');
+    if(state.settings.soundOn){
+      if(enteringBreak){ beep(880,0.13); setTimeout(function(){ beep(880,0.16); },150); }
+      else{ beep(620,0.18); }
+    }
+    if(enteringBreak){ notifyIfAllowed(pomo.isLongBreak ? 'Pause longue' : 'Pause', 'Session terminée — direction la pause.'); }
+    else{ notifyIfAllowed('Au travail', 'La pause est terminée.'); }
   }
   function tickEnsureDay(){
     var t = todayISO();
@@ -360,7 +494,8 @@ import { firebaseConfig } from "./firebase-config.js";
           var t = state.tasks.find(function(t){ return t.id===pomo.linkedTaskId; });
           if(t) t.pomodoroCount = (t.pomodoroCount||0) + 1;
         }
-        pomo.mode = 'break'; pomo.remaining = state.settings.breakMin*60;
+        pomo.isLongBreak = (state.settings.sessionsToday % 4 === 0);
+        pomo.mode = 'break'; pomo.remaining = (pomo.isLongBreak ? state.settings.longBreakMin : state.settings.breakMin) * 60;
         announceTransition();
         scheduleSave(); renderAll();
       } else {
@@ -373,6 +508,7 @@ import { firebaseConfig } from "./firebase-config.js";
   }
   function pomoStart(){
     if(pomo.running) return;
+    if('Notification' in window && Notification.permission === 'default'){ Notification.requestPermission(); }
     pomo.running = true;
     pomo.intervalId = setInterval(pomoTick, 1000);
     renderPomoDial();
@@ -380,7 +516,7 @@ import { firebaseConfig } from "./firebase-config.js";
   function pomoPause(){ pomo.running = false; clearInterval(pomo.intervalId); renderPomoDial(); }
   function pomoReset(){
     pomo.running = false; clearInterval(pomo.intervalId);
-    pomo.mode = 'work'; pomo.remaining = state.settings.workMin*60;
+    pomo.mode = 'work'; pomo.isLongBreak = false; pomo.remaining = state.settings.workMin*60;
     renderPomoDial();
   }
 
@@ -465,6 +601,8 @@ import { firebaseConfig } from "./firebase-config.js";
     document.documentElement.setAttribute('data-theme', theme);
     document.getElementById('themeBtn').innerHTML = theme==='dark' ? sunIcon() : moonIcon();
     document.getElementById('themeBtn').title = theme==='dark' ? 'Passer en thème clair (D)' : 'Passer en thème sombre (D)';
+    var meta = document.getElementById('themeColorMeta');
+    if(meta) meta.setAttribute('content', theme==='dark' ? '#15171c' : '#f2eee4');
     state.settings.theme = theme;
   }
   function toggleTheme(){
@@ -549,7 +687,11 @@ import { firebaseConfig } from "./firebase-config.js";
         }
         break;
       case 'toggle-done': toggleDone(id); break;
-      case 'toggle-menu': btn.closest('.task').classList.toggle('expanded'); break;
+      case 'toggle-menu':
+        if(expandedTaskIds.has(id)) expandedTaskIds.delete(id); else expandedTaskIds.add(id);
+        btn.closest('.task').classList.toggle('expanded');
+        break;
+      case 'rename-task': renameTask(id); break;
       case 'move-task': moveTask(id, btn.dataset.target); break;
       case 'set-due': setDue(id, btn.dataset.due); break;
       case 'link-pomodoro':
@@ -557,7 +699,8 @@ import { firebaseConfig } from "./firebase-config.js";
         renderPomoTaskSelect();
         document.querySelector('.pomodoro-panel').scrollIntoView({ behavior:'smooth', block:'center' });
         break;
-      case 'delete-task': confirmable(btn, function(){ deleteTask(id); }); break;
+      case 'delete-task': deleteTask(id); break;
+      case 'undo-delete': undoDelete(); break;
       case 'clear-done': confirmable(btn, clearDone); break;
       case 'pomodoro-toggle': pomo.running ? pomoPause() : pomoStart(); break;
       case 'pomodoro-reset': pomoReset(); break;
@@ -578,8 +721,24 @@ import { firebaseConfig } from "./firebase-config.js";
     if(e.target.id === 'breakMinInput'){
       var vb = Math.max(1, Math.min(60, parseInt(e.target.value,10)||5));
       state.settings.breakMin = vb;
-      if(pomo.mode==='break' && !pomo.running) pomo.remaining = vb*60;
+      if(pomo.mode==='break' && !pomo.isLongBreak && !pomo.running) pomo.remaining = vb*60;
       renderPomoDial(); scheduleSave();
+    }
+    if(e.target.id === 'longBreakMinInput'){
+      var vl = Math.max(1, Math.min(120, parseInt(e.target.value,10)||15));
+      state.settings.longBreakMin = vl;
+      if(pomo.mode==='break' && pomo.isLongBreak && !pomo.running) pomo.remaining = vl*60;
+      renderPomoDial(); scheduleSave();
+    }
+  });
+
+  // Validation / annulation du renommage inline d'une tâche, centralisées ici
+  // pour éviter toute course entre la touche Échap et la perte de focus.
+  document.addEventListener('focusout', function(e){
+    if(e.target.classList && e.target.classList.contains('task-title-edit')){
+      if(cancelRename){ editingTaskId = null; renderAll(); }
+      else { commitRename(e.target.dataset.id, e.target.value); }
+      cancelRename = false;
     }
   });
 
@@ -601,6 +760,11 @@ import { firebaseConfig } from "./firebase-config.js";
 
   document.addEventListener('keydown', function(e){
     if(document.getElementById('mainContent').hidden) return;
+    if(e.target.classList && e.target.classList.contains('task-title-edit')){
+      if(e.key === 'Enter'){ e.preventDefault(); e.target.blur(); }
+      else if(e.key === 'Escape'){ e.preventDefault(); cancelRename = true; e.target.blur(); }
+      return;
+    }
     var tag = (e.target.tagName || '').toLowerCase();
     var typing = tag==='input' || tag==='textarea' || tag==='select';
     if(typing){ if(e.key === 'Escape') e.target.blur(); return; }
@@ -609,10 +773,17 @@ import { firebaseConfig } from "./firebase-config.js";
     if(e.key === 'd' || e.key === 'D'){ toggleTheme(); }
   });
 
+  if('serviceWorker' in navigator){
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('./sw.js').catch(function(){ /* installation impossible, sans gravité */ });
+    });
+  }
+
   /* ===================== INIT ===================== */
   applyTheme(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
   document.getElementById('workMinInput').value = state.settings.workMin;
   document.getElementById('breakMinInput').value = state.settings.breakMin;
+  document.getElementById('longBreakMinInput').value = state.settings.longBreakMin;
   pomo.remaining = state.settings.workMin*60;
   updateQuadPreview();
   renderPomodoro();
